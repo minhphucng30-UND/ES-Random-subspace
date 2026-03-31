@@ -226,14 +226,17 @@ def build_principal_projection_dict(model: nn.Module, filter_rank: int) -> Dict[
 def _eggroll_update_buckets(
     model: nn.Module,
 ) -> Dict[Tuple[int, int, torch.dtype, torch.device], List[Tuple[torch.nn.Parameter, int, str]]]:
-    """Group 2D weights by (out, in, dtype, device); lid and full_name match EggRollLinear."""
+    """Group only perturbed EggRollLinear weights by (out, in, dtype, device)."""
     buckets: Dict[Tuple[int, int, torch.dtype, torch.device], List[Tuple[torch.nn.Parameter, int, str]]] = defaultdict(list)
-    for name, p in model.named_parameters():
-        if not p.requires_grad or p.dim() != 2:
+    for _, module in model.named_modules():
+        if not isinstance(module, EggRollLinear):
+            continue
+        p = module.weight
+        if (p is None) or (not p.requires_grad) or p.dim() != 2:
             continue
         key = (p.shape[0], p.shape[1], p.dtype, p.device)
-        full_name = _module_key_from_param_name(name)
-        lid = _stable_layer_id(full_name)
+        full_name = module.full_name
+        lid = module._layer_id
         buckets[key].append((p, lid, full_name))
     return buckets
 
@@ -437,12 +440,19 @@ def normalize_rewards(seed_to_signal: Dict[int, float]) -> Dict[int, float]:
     return {s: (v - mean) / (std + 1e-8) for s, v in seed_to_signal.items()}
 
 
-def es_train(rank: int, world_size: int, args: argparse.Namespace, init_method: str) -> None:
+def es_train(
+    rank: int,
+    world_size: int,
+    args: argparse.Namespace,
+    init_method: str,
+    local_rank: Optional[int] = None,
+) -> None:
     dist.init_process_group("nccl", init_method=init_method, rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    device_index = rank if local_rank is None else local_rank
+    torch.cuda.set_device(device_index)
     if rank == 0:
         wandb.init(project="es-sft", name=f"eggroll-sft-r{args.lora_rank}", config=vars(args))
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{device_index}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -608,10 +618,11 @@ def _run_with_spawn(args: argparse.Namespace) -> None:
 def _run_with_torchrun(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     master_addr = os.environ["MASTER_ADDR"]
     master_port = os.environ["MASTER_PORT"]
     init_method = f"tcp://{master_addr}:{master_port}"
-    es_train(rank, world_size, args, init_method)
+    es_train(rank, world_size, args, init_method, local_rank=local_rank)
 
 
 if __name__ == "__main__":
